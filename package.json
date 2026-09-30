@@ -1,0 +1,24 @@
+{
+  "name": "rndvid",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TUI that picks a random video from a folder and opens it with your default player",
+  "bin": {
+    "rndvid": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/logic.test.ts tests/search-select.test.ts",
+    "test:e2e": "bun run tests/e2e-cli.ts",
+    "check": "bun run typecheck && bun run test && bun run test:e2e"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.11.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.14",
+    "typescript": "^5.7.2"
+  }
+}

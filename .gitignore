@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+.junk/
+
+# Lockfiles — bun.lock is committed; this catches npm/yarn/pnpm artefacts
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.npm/
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Local app data — never commit anyone's watch history or settings
+*.local.json
+.env
+.env.*
+!.env.example
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+Desktop.ini
+
+# Logs and temp files
+*.log
+npm-debug.log*
+yarn-error.log*
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+
+# Scratch files from ad-hoc probing
+probe*.ts
+scratch/
+tmp/
+
+# Media files, in case someone drops a real video into the repo. Note that
+# *.ts is deliberately NOT here — that's TypeScript source in this project, and
+# ignoring it would exclude every file under src/.
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.webm
+*.flv
+*.wmv
+*.m4v
+*.m4a
+*.m4b
+*.mp3
+*.flac
