@@ -19,9 +19,16 @@ import {
 import { scanVideos, scanMedia, DEFAULT_MAX_DEPTH } from "../src/scan.ts";
 import { videoExtension, modeExtension, isMediaMode, isAnyMedia } from "../src/extensions.ts";
 import type { MediaMode } from "../src/extensions.ts";
-import { folderKey } from "../src/config.ts";
+import { folderKey, withRecentFolder } from "../src/config.ts";
 import { History } from "../src/history.ts";
-import type { VideoFile } from "../src/scan.ts";
+import { withRecentFile } from "../src/recent.ts";
+import { buildTree, filesUnder, folderFor, treeLine, type TreeNode } from "../src/tree.ts";
+import { panel, footer, formatDuration } from "../src/ui.ts";
+import { SHORTCUTS, shortcutFor, helpLines } from "../src/shortcuts.ts";
+import type { MediaFile } from "../src/scan.ts";
+
+/** Alias kept so the existing History fixtures read unchanged. */
+type VideoFile = MediaFile;
 
 describe("randomInt", () => {
   test("stays in range", () => {
@@ -214,6 +221,41 @@ describe("filterBySize", () => {
 
   test("max only", () => {
     expect(filterBySize(files, { max: 100 * mb }).length).toBe(2);
+  });
+});
+
+describe("formatDuration", () => {
+  test("drops zero seconds and minutes", () => {
+    expect(formatDuration(45_000)).toBe("45s");
+    expect(formatDuration(22 * 60_000)).toBe("22m");
+    expect(formatDuration(22 * 60_000 + 10_000)).toBe("22m 10s");
+    expect(formatDuration(60 * 60_000)).toBe("1h");
+    expect(formatDuration(64 * 60_000)).toBe("1h 04m");
+  });
+
+  test("rejects nonsense", () => {
+    expect(formatDuration(-1)).toBe("-");
+    expect(formatDuration(Number.NaN)).toBe("-");
+  });
+});
+
+describe("panel", () => {
+  test("wraps lines in a box", () => {
+    const lines = panel(["hello", "world"], "title", 20);
+    expect(lines).toHaveLength(4);
+    expect(lines[0]).toContain("title");
+    expect(lines[3]).toContain("└");
+    expect(plain(lines[1])).toContain("hello");
+  });
+
+  test("handles an absent title", () => {
+    const lines = panel(["x"], undefined, 20);
+    expect(plain(lines[0])).toContain("┌");
+  });
+
+  test("footer drops empty parts", () => {
+    expect(plain(footer(["a", "", "b"]))).toContain("a · b");
+    expect(plain(footer(["a", "", ""]))).not.toContain("·");
   });
 });
 
@@ -652,5 +694,309 @@ describe("History", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("markWatched returns an undo token that restores prior state", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rndvid-hist-"));
+    try {
+      const file = makeFile("a.mp4");
+      const history = await History.load(root);
+
+      // First mark: nothing existed, so the token is null and undo removes it.
+      const firstToken = history.markWatched(file);
+      expect(firstToken).toBeNull();
+      expect(history.undo(file, firstToken)).toBe(true);
+      expect(history.has(file)).toBe(false);
+
+      // Second mark over an existing entry restores the old one rather than
+      // deleting the key outright.
+      history.markWatched(file);
+      history.recordSession(file, 60_000);
+      const secondToken = history.markWatched(file);
+      expect(secondToken).not.toBeNull();
+      expect(secondToken!.plays).toBe(1);
+      expect(secondToken!.watchedMs).toBe(60_000);
+      expect(history.undo(file, secondToken)).toBe(true);
+      expect(history.has(file)).toBe(true);
+      expect(history.watchedMs(file)).toBe(60_000);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("undo on an absent entry reports no change", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rndvid-hist-"));
+    try {
+      const history = await History.load(root);
+      expect(history.undo(makeFile("ghost.mp4"), null)).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recordSession keeps the longest run", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rndvid-hist-"));
+    try {
+      const file = makeFile("a.mp4");
+      const history = await History.load(root);
+      history.markWatched(file);
+
+      history.recordSession(file, 600_000);
+      expect(history.watchedMs(file)).toBe(600_000);
+
+      // A later, shorter session must not shrink the record.
+      history.recordSession(file, 5_000);
+      expect(history.watchedMs(file)).toBe(600_000);
+
+      // Nonsense durations are ignored rather than stored.
+      history.recordSession(file, -1);
+      history.recordSession(file, Number.NaN);
+      expect(history.watchedMs(file)).toBe(600_000);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recordSession ignores a file that was never opened", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rndvid-hist-"));
+    try {
+      const history = await History.load(root);
+      history.recordSession(makeFile("never.mp4"), 1000);
+      expect(history.count).toBe(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("watchedMs survives a save and reload", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rndvid-hist-"));
+    try {
+      const file = makeFile("a.mp4");
+      const history = await History.load(root);
+      history.markWatched(file);
+      history.recordSession(file, 90_000);
+      await history.save();
+
+      const reloaded = await History.load(root);
+      expect(reloaded.watchedMs(file)).toBe(90_000);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("withRecentFolder", () => {
+  test("puts the newest folder first", () => {
+    const out = withRecentFolder(["C:\\a", "C:\\b"], "C:\\c");
+    expect(out[0]).toBe("C:\\c");
+    expect(out).toHaveLength(3);
+  });
+
+  test("moves a re-used folder to the front without duplicating", () => {
+    const out = withRecentFolder(["C:\\a", "C:\\b"], "C:\\b");
+    expect(out[0]).toBe("C:\\b");
+    expect(out.filter((f) => f === "C:\\b")).toHaveLength(1);
+    expect(out).toHaveLength(2);
+  });
+
+  test("de-duplicates case-insensitively and trims trailing slashes", () => {
+    const out = withRecentFolder(["c:\\Lib"], "C:\\Lib\\");
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/C:\\Lib$/);
+  });
+
+  test("respects the limit, keeping the newest", () => {
+    let out: string[] = [];
+    for (const folder of ["C:\\1", "C:\\2", "C:\\3", "C:\\4"]) {
+      out = withRecentFolder(out, folder, 2);
+    }
+    expect(out).toHaveLength(2);
+    expect(out[0]).toBe("C:\\4");
+  });
+});
+
+describe("withRecentFile", () => {
+  const entry = (folder: string, rel: string, openedAt: number) => ({
+    folder,
+    rel,
+    name: rel.split("/").pop()!,
+    openedAt,
+  });
+
+  test("newest first", () => {
+    const out = withRecentFile([entry("C:\\lib", "a.mp4", 1)], entry("C:\\lib", "b.mp4", 2));
+    expect(out[0]!.rel).toBe("b.mp4");
+  });
+
+  test("reopening moves an entry to the front instead of duplicating", () => {
+    const out = withRecentFile(
+      [entry("C:\\lib", "a.mp4", 2), entry("C:\\lib", "b.mp4", 1)],
+      entry("C:\\lib", "a.mp4", 3),
+    );
+    expect(out[0]!.rel).toBe("a.mp4");
+    expect(out.filter((e) => e.rel === "a.mp4")).toHaveLength(1);
+    expect(out).toHaveLength(2);
+  });
+
+  test("same filename in different folders stays separate", () => {
+    const out = withRecentFile([entry("C:\\one", "a.mp4", 1)], entry("C:\\two", "a.mp4", 2));
+    expect(out).toHaveLength(2);
+  });
+
+  test("respects the limit", () => {
+    const many = Array.from({ length: 5 }, (_, i) => entry("C:\\lib", `${i}.mp4`, i));
+    expect(withRecentFile(many, entry("C:\\lib", "new.mp4", 9), 3)).toHaveLength(3);
+  });
+});
+
+describe("shortcuts", () => {
+  test("maps every declared key to its action", () => {
+    for (const shortcut of SHORTCUTS) {
+      expect(shortcutFor(shortcut.keys)).toBe(shortcut.action);
+    }
+  });
+
+  test("is case-insensitive", () => {
+    expect(shortcutFor("T")).toBe("tree");
+    expect(shortcutFor("u")).toBe(shortcutFor("U"));
+  });
+
+  test("unknown keys return null", () => {
+    expect(shortcutFor("z")).toBeNull();
+    expect(shortcutFor("")).toBeNull();
+  });
+
+  test("help panel lists every shortcut", () => {
+    const help = helpLines();
+    expect(help).toHaveLength(SHORTCUTS.length);
+    for (const shortcut of SHORTCUTS) {
+      expect(help.some((line) => line.includes(shortcut.label))).toBe(true);
+    }
+  });
+});
+
+/** Strip ANSI so box-drawing and label assertions read as plain text. */
+function plain(text: string): string {
+  return text.replace(/\u001B\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "");
+}
+
+describe("treeLine", () => {
+  const node = (rel: string, kind: "folder" | "file", file?: MediaFile): TreeNode => ({
+    name: rel.split("/").pop()!,
+    rel,
+    depth: rel === "" ? 0 : 1,
+    kind,
+    file,
+    children: [],
+    expanded: kind === "folder",
+    fileCount: kind === "folder" ? 7 : undefined,
+  });
+
+  test("folders show a disclosure arrow and a file count", async () => {
+    const history = await History.load(path.join(os.tmpdir(), "rndvid-line-test"));
+    const line = plain(treeLine(node("Season 1", "folder"), false, history, 60));
+    expect(line).toContain("▾");
+    expect(line).toContain("Season 1");
+    expect(line).toContain("7");
+  });
+
+  test("collapsed folders show the closed arrow", async () => {
+    const history = await History.load(path.join(os.tmpdir(), "rndvid-line-test"));
+    const folder = node("Season 1", "folder");
+    folder.expanded = false;
+    expect(plain(treeLine(folder, false, history, 60))).toContain("▸");
+  });
+
+  test("the root omits its own count, which the header already states", async () => {
+    const history = await History.load(path.join(os.tmpdir(), "rndvid-line-test"));
+    const line = plain(treeLine(node("", "folder"), false, history, 60));
+    expect(line).not.toContain("7");
+  });
+
+  test("unwatched files use an empty marker", async () => {
+    const history = await History.load(path.join(os.tmpdir(), "rndvid-line-test"));
+    const file: MediaFile = {
+      path: "/x/a.mp4",
+      name: "a.mp4",
+      ext: "mp4",
+      rel: "a.mp4",
+      size: 1024,
+      mtimeMs: 0,
+    };
+    expect(plain(treeLine(node("a.mp4", "file", file), false, history, 60))).toContain("○");
+  });
+});
+
+describe("buildTree", () => {
+  const file = (rel: string): MediaFile => ({
+    path: `/lib/${rel}`,
+    name: rel.split("/").pop()!,
+    ext: "mp4",
+    rel,
+    size: 100,
+    mtimeMs: 0,
+  });
+
+  test("nests files under their folders", () => {
+    const root = buildTree(
+      [file("top.mp4"), file("Season 1/ep01.mp4"), file("Season 1/ep02.mp4")],
+      "lib",
+    );
+    expect(root.name).toBe("lib");
+    expect(root.children.map((c) => c.name)).toEqual(["Season 1", "top.mp4"]);
+
+    const season = root.children[0]!;
+    expect(season.kind).toBe("folder");
+    expect(season.fileCount).toBe(2);
+    expect(season.children.map((c) => c.name)).toEqual(["ep01.mp4", "ep02.mp4"]);
+  });
+
+  test("root counts roll up from descendants", () => {
+    const root = buildTree([file("a/b/c/deep.mp4"), file("top.mp4")], "lib");
+    expect(root.fileCount).toBe(2);
+  });
+
+  test("creates intermediate folders for deep paths", () => {
+    const root = buildTree([file("a/b/c/deep.mp4")], "lib");
+    const a = root.children[0]!;
+    const b = a.children[0]!;
+    const c = b.children[0]!;
+    expect([a.name, b.name, c.name]).toEqual(["a", "b", "c"]);
+    expect(c.children[0]!.name).toBe("deep.mp4");
+  });
+
+  test("folders sort before files, each alphabetically", () => {
+    const root = buildTree(
+      [file("zeta.mp4"), file("alpha.mp4"), file("mfolder/x.mp4"), file("afolder/y.mp4")],
+      "lib",
+    );
+    expect(root.children.map((c) => c.name)).toEqual([
+      "afolder",
+      "mfolder",
+      "alpha.mp4",
+      "zeta.mp4",
+    ]);
+  });
+
+  test("filesUnder collects the whole subtree", () => {
+    const root = buildTree([file("top.mp4"), file("Season 1/ep01.mp4")], "lib");
+    const season = root.children[0]!;
+    expect(filesUnder(season).map((f) => f.rel)).toEqual(["Season 1/ep01.mp4"]);
+    expect(filesUnder(root).map((f) => f.rel).sort()).toEqual([
+      "Season 1/ep01.mp4",
+      "top.mp4",
+    ]);
+  });
+
+  test("folderFor maps a node back to an absolute path", () => {
+    const root = buildTree([file("Season 1/ep01.mp4")], "lib");
+    expect(folderFor(root, "/lib")).toBe("/lib");
+    expect(folderFor(root.children[0]!, "/lib")).toBe(path.join("/lib", "Season 1"));
+  });
+
+  test("an empty library yields a bare root", () => {
+    const root = buildTree([], "lib");
+    expect(root.children).toHaveLength(0);
+    expect(root.fileCount).toBe(0);
   });
 });

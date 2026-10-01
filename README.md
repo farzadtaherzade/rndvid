@@ -1,5 +1,7 @@
 # rndvid
 
+[English](README.md) · [فارسی](README.fa.md)
+
 Pick a random video, book or audio file from a folder and open it with whatever
 app handles that format.
 
@@ -75,13 +77,66 @@ are skipped by name at any depth. Unreadable folders are reported and skipped,
 never fatal. Symlinks are tracked by realpath, so a circular link can't make the
 scan loop.
 
+## Returning to your last folder
+
+When you've confirmed a library before, the next run offers it:
+
+```
+◆  Return to D:\Videos\Some Show?  (298 videos)
+│  ❯ Yes
+│    No, pick a folder
+```
+
+Your answer is remembered. Answer yes and it stops asking entirely; answer no and
+it goes straight to the browser. Recent folders are one keystroke away with `R`,
+and folders you've since deleted are pruned so the list never fills with paths
+that can't be opened.
+
+## Tree view
+
+`t` opens a collapsible tree of the library:
+
+```
+◆  Video library
+│  filter none
+│  ❯ ▾ library
+│      ▾ Season 1  2
+│        ✓ S01E01.mkv    700 MiB  22m
+│        ○ S01E02.mkv    668 MiB
+│      ▾ Season 2  13
+│      ○ top.mp4         150 MiB
+│
+└  ↑↓ move · → expand · ← collapse · enter roll · / filter · esc cancel   1/8
+```
+
+`↑↓` to move, `→` expand, `←` collapse, `Enter` to roll from the selected folder.
+`/` filters the tree, keeping ancestors so the path stays readable. `✓` means
+opened, `○` means not yet, and the trailing duration is how long you had it open.
+
+## Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `1` `3` `5` | roll 1 / 3 / 5 |
+| `a` | roll everything |
+| `t` | tree view |
+| `r` | recently opened files |
+| `R` | recent folders |
+| `f` | size filter |
+| `u` | undo the last pick |
+| `w` | skip already-opened on/off |
+| `l` | library view |
+| `d` | change folder |
+| `m` | change media mode |
+| `?` | help panel |
+| `q` | quit |
+
+`Enter` is the default: roll again the same way.
+
 ## In the browser
 
 Type to filter, `↑`/`↓` to move, `Enter` to open a folder or confirm the scan,
 `Esc` to clear the search — and a second `Esc` to cancel.
-
-At the end of a roll you can answer `y` (same again), `n` (different folder),
-`m` (different media), or `d` (different folder).
 
 ## Size filters
 
@@ -129,7 +184,23 @@ launched when the previous app closes.
 hash of the folder path, and recorded on *launch* rather than on completion — a
 player that fails to start still counts, so you won't re-roll the same broken
 file forever. History is keyed by path relative to the folder, so renaming or
-moving files inside your library keeps their history.
+moving files inside your library keeps their history. `u` undoes the last mark
+and puts the file back in the pool.
+
+### Resume where you stopped — read this before expecting it to work
+
+There is **no** way to resume playback position on Windows without the player's
+cooperation, and each player wants different flags. What this actually does:
+
+- Records how long you had each file open (wall-clock, from launch to the app
+  exiting) and keeps the longest session.
+- Shows that as a real duration next to the file in the tree.
+
+So `22m` next to an episode means "you had it open for 22 minutes", which is a
+proxy for how far in you got — **not** a verified position. If your player
+supports seeking, you can define a resume-argument template in settings (for
+example `mpv --start={time}`), but it's off by default because getting it wrong
+per player is worse than not offering it.
 
 ## Opening files
 
@@ -155,33 +226,38 @@ reg query "HKCR\.mp4"
 
 ```
 bun run typecheck   # tsc, strict
-bun run test        # 82 unit tests: RNG, filters, fuzzy, registry, scan, history, modes
-bun run test:e2e    # 71 end-to-end checks driving the real CLI
+bun run test        # 132 unit tests: RNG, filters, fuzzy, registry, scan, history, tree
+bun run test:e2e    # 83 end-to-end checks driving the real CLI
 bun run check       # all three
 ```
 
 Unit tests cover the pure logic, including a chi-square check on the RNG, a live
-read of your own registry, and the depth cap against synthetic trees at
-known depths. The e2e suite drives the actual binary via `--dry-run` against a
-temp fixture, asserting on roll uniqueness, per-mode format isolation, size
-filters, depth truncation, history, and argument validation.
+read of your own registry, the depth cap against synthetic trees at known depths,
+the tree builder's folding and sorting, and undo/session bookkeeping. The e2e
+suite drives the actual binary via `--dry-run` against a temp fixture, asserting
+on roll uniqueness, per-mode format isolation, size filters, depth truncation,
+recent-folder tracking, history, and argument validation.
 
 The interactive prompts are tested by injecting fake streams
-(`tests/search-select.test.ts`), because keystroke-driven testing via node-pty
-doesn't work on this machine — its ConPTY backend delivers no input to the child,
-even to a plain `readline` script. That was verified before being ruled out; the
-prompt's key handling, filtering, and redraw logic are covered the injectable way
-instead.
+(`tests/search-select.test.ts`, `tests/tree.test.ts`), because keystroke-driven
+testing via node-pty doesn't work on this machine — its ConPTY backend delivers
+no input to the child, even to a plain `readline` script. That was verified
+before being ruled out; the prompts' key handling, filtering, and redraw logic are
+covered the injectable way instead.
 
 For scale: a `--dry-run` over a 62 GB drive holding shows and course recordings
-found 962 videos across 136 folders in ~1.4s, matching a manual PowerShell count
-of the same tree exactly.
+found just under 1000 videos across 136 folders in about 1.4 seconds, matching a
+manual PowerShell count of the same tree exactly.
 
 ## Layout
 
 ```
 src/
   index.ts         argument parsing, the roll/play loop
+  tree.ts          collapsible library tree
+  shortcuts.ts     key bindings and the help panel
+  recent.ts        recently opened files
+  keypress.ts      single-keystroke reader for the action bar
   scan.ts          recursive walk, depth cap, symlink and permission handling
   filters.ts       size parsing and filtering
   random.ts        unbiased RNG, N-unique selection
@@ -189,10 +265,10 @@ src/
   search-select.ts the searchable list prompt
   picker.ts        media menu, drive picker, folder browser, library view
   player.ts        Windows association resolution and launching
-  history.ts       per-folder watch history
-  config.ts        %APPDATA% paths, settings, folder hashing
+  history.ts       per-folder watch history, undo, session lengths
+  config.ts        %APPDATA% paths, settings, recent folders
   extensions.ts    per-mode format tables
-  ui.ts            colour and formatting helpers
+  ui.ts            colour, panels, durations
 ```
 
 Note that `ts` is in the video list, so pointing video mode at a source tree

@@ -10,7 +10,7 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test tests/logic.test.ts tests/search-select.test.ts",
+    "test": "bun test tests/logic.test.ts tests/search-select.test.ts tests/tree.test.ts",
     "test:e2e": "bun run tests/e2e-cli.ts",
     "check": "bun run typecheck && bun run test && bun run test:e2e"
   },

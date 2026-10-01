@@ -462,6 +462,114 @@ check("lists supported formats", /Supported: avi flv m4v mkv/.test(out), out);
     await fs.rm(deep, { recursive: true, force: true });
   }
 
+  // ---- resume prompt and recent folders ----
+  console.log("resume + recents");
+  {
+    // Two libraries so "the last folder" is distinguishable from the fixture.
+    const second = path.join(SANDBOX, "second-library");
+    await fs.mkdir(second, { recursive: true });
+    const handle = await fs.open(path.join(second, "solo.mkv"), "w");
+    await handle.truncate(900 * MIB);
+    await handle.close();
+
+    // Dry-run never prompts, so it stands in for the browser path.
+    run(["--folder", LIBRARY, "--mode", "video", "--count", "1", "--dry-run"]);
+    const settingsAfter = JSON.parse(
+      await fs.readFile(path.join(DATA, "settings.json"), "utf8"),
+    );
+    check(
+      "remembers the library as a recent folder",
+      Array.isArray(settingsAfter.recentFolders) &&
+        settingsAfter.recentFolders.some((f: string) =>
+          f.toLowerCase() === LIBRARY.toLowerCase(),
+        ),
+      JSON.stringify(settingsAfter),
+    );
+
+    // Opening a second library prepends it, most recent first.
+    run(["--folder", second, "--mode", "video", "--count", "1", "--dry-run"]);
+    const settingsBoth = JSON.parse(
+      await fs.readFile(path.join(DATA, "settings.json"), "utf8"),
+    );
+    check(
+      "newest folder is first in recents",
+      settingsBoth.recentFolders[0]?.toLowerCase() === second.toLowerCase(),
+      JSON.stringify(settingsBoth.recentFolders),
+    );
+    // Earlier sections ran against other folders, so assert membership rather than
+    // an exact count.
+    check(
+      "keeps both libraries in recents",
+      settingsBoth.recentFolders.some((f: string) => f.toLowerCase() === LIBRARY.toLowerCase()) &&
+        settingsBoth.recentFolders.some((f: string) => f.toLowerCase() === second.toLowerCase()),
+      JSON.stringify(settingsBoth.recentFolders),
+    );
+
+    // A deleted folder must not linger in the list.
+    await fs.rm(second, { recursive: true, force: true });
+    run(["--folder", LIBRARY, "--mode", "video", "--count", "1", "--dry-run"]);
+    const afterDelete = JSON.parse(
+      await fs.readFile(path.join(DATA, "settings.json"), "utf8"),
+    );
+    check(
+      "a removed folder stops being recent",
+      !afterDelete.recentFolders.some((f: string) => f.toLowerCase() === second.toLowerCase()),
+      JSON.stringify(afterDelete.recentFolders),
+    );
+
+    check("remembers the mode too", afterDelete.mode === "video", JSON.stringify(afterDelete));
+
+    // A dry run must not leave recent-file records behind, since nothing opened.
+    const recentPath = path.join(DATA, "recent.json");
+    const recentExists = await fs
+      .stat(recentPath)
+      .then(() => true)
+      .catch(() => false);
+    check("dry run records no recent files", !recentExists);
+
+    await fs.mkdir(second, { recursive: true });
+  }
+
+  // ---- undo ----
+  console.log("undo");
+  {
+    // Undo rewrites the history file, so drive it through the History API the
+    // action bar uses rather than trying to synthesise a keystroke.
+    const { History } = await import("../src/history.ts");
+    const file = {
+      path: path.join(LIBRARY, "alpha.mp4"),
+      name: "alpha.mp4",
+      ext: "mp4",
+      rel: "alpha.mp4",
+      size: 700 * MIB,
+      mtimeMs: 0,
+    };
+
+    const history = await History.load(LIBRARY);
+    const token = history.markWatched(file);
+    check("a fresh mark has no prior state", token === null);
+    history.recordSession(file, 1_200_000);
+    await history.save();
+
+    const reloaded = await History.load(LIBRARY);
+    check("mark and session persist", reloaded.watchedMs(file) === 1_200_000);
+
+    const undoToken = reloaded.markWatched(file);
+    check("re-mark returns the previous entry", undoToken !== null && undoToken.plays === 1);
+    reloaded.undo(file, undoToken);
+    await reloaded.save();
+
+    const afterUndo = await History.load(LIBRARY);
+    check("undo restores the play count", afterUndo.watchedMs(file) === 1_200_000);
+
+    const removeToken = afterUndo.undo(file, null);
+    check("undo with no prior entry removes the key", removeToken === true);
+    await afterUndo.save();
+
+    const finalHistory = await History.load(LIBRARY);
+    check("undo drops the entry entirely", finalHistory.has(file) === false);
+  }
+
   // ---- settings round-trip ----
   // Runs last: each invocation overwrites lastFolder, so this asserts on the
   // most recent one rather than whichever folder an earlier case happened to use.

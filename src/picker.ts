@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import { listDriveRoots, listSubdirectories, type MediaFile } from "./scan.ts";
 import { searchSelect, isSearchCancel, type SearchOption } from "./search-select.ts";
 import { History } from "./history.ts";
+import type { RecentFile } from "./recent.ts";
 import {
   MEDIA_MODES,
   MODE_HINTS,
@@ -270,6 +271,87 @@ export function rollNoun(count: number, mediaMode: MediaMode): string {
   if (mediaMode === "book") return `${count} book${count === 1 ? "" : "s"}`;
   if (mediaMode === "audio") return `${count} file${count === 1 ? "" : "s"}`;
   return `${count} video${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * Startup prompt offering to return to the remembered library.
+ *
+ * Returns the folder to use, or null when the user wants the browser instead.
+ */
+export async function askResume(
+  folder: string,
+  summary: string,
+  remembered: boolean,
+): Promise<string | null> {
+  const choice = await searchSelect<"resume" | "browse">({
+    message: `Return to ${shortPath(folder, 52)}?${summary ? `  ${summary}` : ""}`,
+    options: [
+      { value: "resume", label: "Yes", hint: "scan it again" },
+      { value: "browse", label: "No, pick a folder", hint: "open the browser" },
+    ],
+    maxVisible: 2,
+    initialValue: remembered ? "resume" : "browse",
+  });
+
+  return isSearchCancel(choice) ? null : choice === "resume" ? folder : null;
+}
+
+/**
+ * Recent folders, newest first, with the vanished ones dropped so the list never
+ * shows paths that can't be opened.
+ */
+export async function chooseRecentFolder(
+  folders: readonly string[],
+  startDir?: string,
+): Promise<string | symbol> {
+  const alive: string[] = [];
+  const options: SearchOption<string>[] = [];
+
+  for (const folder of folders) {
+    if (!(await isDirectory(folder))) continue;
+    alive.push(folder);
+    options.push({ value: folder, label: folder, hint: "recent" });
+  }
+
+  if (options.length === 0) return CANCEL_SYMBOL;
+
+  options.push({ value: START_FROM_BROWSER, label: "Browse instead…", hint: "open the folder browser" });
+
+  const choice = await searchSelect<string>({
+    message: "Recent folders",
+    options,
+    maxVisible: 10,
+    initialValue: startDir,
+  });
+
+  if (isSearchCancel(choice)) return CANCEL_SYMBOL;
+  return choice === START_FROM_BROWSER ? "" : (choice as string);
+}
+
+const START_FROM_BROWSER = "\u0000browse";
+
+/**
+ * Recently opened files, newest first, so a repeat watch is one keystroke away.
+ */
+export async function chooseRecentFile(
+  entries: readonly RecentFile[],
+): Promise<RecentFile | symbol> {
+  if (entries.length === 0) return CANCEL_SYMBOL;
+
+  const options: SearchOption<RecentFile>[] = entries.map((entry) => ({
+    value: entry,
+    label: entry.name,
+    hint: `${relativeTime(entry.openedAt)}  ${shortPath(entry.folder, 32)}`,
+  }));
+
+  const choice = await searchSelect<RecentFile>({
+    message: "Recently opened",
+    options,
+    maxVisible: 10,
+    emptyMessage: "nothing opened yet",
+  });
+
+  return isSearchCancel(choice) ? CANCEL_SYMBOL : (choice as RecentFile);
 }
 
 /** Verb used when launching, since opening a book isn't quite "playing". */

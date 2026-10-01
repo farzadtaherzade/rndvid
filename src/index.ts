@@ -3,14 +3,17 @@ import path from "node:path";
 import fs from "node:fs/promises";
 
 import { scanMedia, DEFAULT_MAX_DEPTH, type MediaFile } from "./scan.ts";
-import { loadSettings, saveSettings, type Settings } from "./config.ts";
-import { History } from "./history.ts";
+import { loadSettings, saveSettings, withRecentFolder, type Settings } from "./config.ts";
+import { History, type HistoryEntry } from "./history.ts";
 import { parseSizeRange, filterBySize, describeLibrary, type SizeRange } from "./filters.ts";
 import { pickMany } from "./random.ts";
 import { openInDefaultPlayer } from "./player.ts";
 import {
+  askResume,
   chooseFolder,
   chooseMediaMode,
+  chooseRecentFile,
+  chooseRecentFolder,
   libraryNoun,
   libraryView,
   noMatchesMessage,
@@ -21,15 +24,23 @@ import {
   type SortMode,
 } from "./picker.ts";
 import { searchSelect, isSearchCancel } from "./search-select.ts";
+import { treePrompt, filesUnder } from "./tree.ts";
+import { loadRecentFiles, recordRecentFile, type RecentFile } from "./recent.ts";
+import { shortcutFor, helpLines, HELP_HINT } from "./shortcuts.ts";
+import { readOneKey, isOneKeyCancel } from "./keypress.ts";
 import { MEDIA_MODES, MODE_HINTS, MODE_LABELS, isMediaMode, type MediaMode } from "./extensions.ts";
 import {
   color,
   confirm,
+  footer,
   formatBytes,
+  formatDuration,
   intro,
   isCancel,
   log,
   outro,
+  panel,
+  shortPath,
   spinner,
   text,
 } from "./ui.ts";
@@ -174,7 +185,38 @@ async function resolveFolder(args: Args, settings: Settings): Promise<string | s
     }
     return resolved;
   }
-  return chooseFolder(undefined, settings.lastFolder);
+
+  // Offer the remembered library instead of dropping straight into the browser,
+  // but only when the user last said yes to being asked.
+  const remembered = settings.lastFolder;
+  const resumeWorthAsking =
+    remembered !== undefined && settings.resumeLastFolder !== false && !args.dryRun;
+
+  if (resumeWorthAsking && remembered) {
+    let exists = false;
+    try {
+      exists = (await fs.stat(remembered)).isDirectory();
+    } catch {
+      exists = false;
+    }
+
+    if (exists) {
+      const choice = await askResume(remembered, "", settings.resumeLastFolder !== false);
+      if (choice === null) return Symbol.for("rndvid.cancel");
+      if (choice === remembered) {
+        // Remember the preference so next time either asks or doesn't.
+        if (settings.resumeLastFolder !== true) {
+          settings = { ...settings, resumeLastFolder: true };
+          await saveSettings(settings).catch(() => {});
+        }
+        return remembered;
+      }
+      settings = { ...settings, resumeLastFolder: false };
+      await saveSettings(settings).catch(() => {});
+    }
+  }
+
+  return chooseFolder(undefined, remembered);
 }
 
 /**
@@ -283,13 +325,20 @@ async function main(): Promise<number> {
   let root: string = startFolder;
 
   // Remember the library for next time, so the browser reopens where you left off.
-  settings = { ...settings, lastFolder: root, mode: mediaMode };
+  settings = {
+    ...settings,
+    lastFolder: root,
+    mode: mediaMode,
+    recentFolders: withRecentFolder(settings.recentFolders ?? [], root, settings.recentLimit),
+  };
   await saveSettings(settings).catch(() => {
     /* a read-only APPDATA shouldn't stop the run */
   });
 
   let watchMode = settings.waitForPlayer !== false && !args.detach;
   let sortMode: SortMode = "name";
+  /** Most recent launch, so `u` can put it back. */
+  let lastPick: { file: MediaFile; token: HistoryEntry | null; history: History } | null = null;
 
   outer: for (;;) {
     const scan = await runScan(root, mediaMode, args.maxDepth);
@@ -329,6 +378,24 @@ async function main(): Promise<number> {
       color.bold(describeLibrary(scan.files, libraryNoun(mediaMode))) +
         (history.count > 0 ? color.dim(` · ${history.count} watched before`) : ""),
     );
+
+    // Keep the recent list honest: folders that disappeared shouldn't accumulate
+    // into a startup menu full of paths that can't be opened.
+    const recents = settings.recentFolders ?? [];
+    if (recents.length > 0) {
+      const alive: string[] = [];
+      for (const folder of recents) {
+        try {
+          if ((await fs.stat(folder)).isDirectory()) alive.push(folder);
+        } catch {
+          // Gone; drop it.
+        }
+      }
+      if (alive.length !== recents.length) {
+        settings = { ...settings, recentFolders: alive };
+        await saveSettings(settings).catch(() => {});
+      }
+    }
 
     if (history.stale) {
       log.warn("History was written for a different path; treating as fresh.");
@@ -447,6 +514,18 @@ async function main(): Promise<number> {
       log.message(`  ${position}  ${label}  ${color.dim(formatBytes(file.size))}`);
     }
 
+    // Status line: what's in play right now. Cheap to compute and it removes the
+    // need to scroll back for the mode, folder and pool size.
+    log.message(
+      footer([
+        MODE_LABELS[mediaMode],
+        shortPath(root, 40),
+        `${pool.length} in pool`,
+        excludeWatched ? "skipping watched" : "",
+        HELP_HINT,
+      ]),
+    );
+
     // --dry-run stops here: everything above is real, nothing is asked or played.
     if (args.dryRun) break;
 
@@ -467,44 +546,145 @@ async function main(): Promise<number> {
       const file = picks[i]!;
       log.message(`\n${color.gray(`[${i + 1}/${picks.length}]`)} ${describeFile(file)}`);
 
-      // Record before launching so a player that crashes still counts as watched.
-      history.markWatched(file);
+      // Record before launching so a player that crashes still counts as watched,
+      // and keep the token so `u` can undo exactly this mark.
+      const token = history.markWatched(file);
+      lastPick = { file, token, history };
       await history.save().catch(() => {});
+      await recordRecentFile({
+        folder: root,
+        rel: file.rel,
+        name: file.name,
+        openedAt: Date.now(),
+      }).catch(() => {});
 
+      const startedAt = Date.now();
       const result = await openInDefaultPlayer(file.path, { wait: watchMode });
       if (!result.ok) {
         log.error(`Could not open ${file.name}: ${result.error ?? "unknown error"}`);
       } else if (!result.waited) {
-        // Fallback path via `start`: we can't see when the player exits.
+        // Fallback path via `start`: we can't see when the player exits, so the
+        // session length has to come from the user dismissing the prompt.
         await waitForReturn();
+      }
+
+      // Wall-clock time with the file open. A proxy for how far in you got, not a
+      // real position — nothing asks the player where it is.
+      const sessionMs = Date.now() - startedAt;
+      if (sessionMs > 30_000) {
+        history.recordSession(file, sessionMs);
+        await history.save().catch(() => {});
+        log.message(color.dim(`  watched ${formatDuration(sessionMs)}`));
       }
     }
 
-    // After a roll, offer the things you might reasonably do next rather than a bare
-// yes/no, since the answer is often "different folder" or "different media".
-const next = await text({
-      message: "Roll again? (y = same, n = pick another, m = change media, d = change folder)",
-      placeholder: "y",
-      initialValue: "y",
-      validate: (value) => {
-        const key = value.trim().toLowerCase();
-        return ["", "y", "yes", "n", "no", "m", "d"].includes(key) ? undefined : "answer y, n, m, or d";
-      },
-    });
-    if (isCancel(next)) break;
+    // Shortcut bar. Single keystrokes, so Enter means "the default" (roll again).
+    const next = await actionBar();
+    if (next === "quit" || next === null) break;
 
-    const answer = String(next).trim().toLowerCase();
+    if (next === "undo") {
+      if (!lastPick) {
+        log.warn("Nothing to undo.");
+        continue;
+      }
+      const undone = lastPick.history.undo(lastPick.file, lastPick.token);
+      await lastPick.history.save().catch(() => {});
+      if (undone) {
+        log.info(`Put back: ${lastPick.file.rel}`);
+        lastPick = null;
+      }
+      continue;
+    }
 
-    if (answer === "n" || answer === "d") {
-      const picked = await chooseFolder(undefined, root);
-      if (typeof picked !== "string") break;
-      root = picked;
-      settings = { ...settings, lastFolder: picked };
+    if (next === "toggleWatched") {
+      excludeWatched = !excludeWatched;
+      log.info(`Skip watched: ${excludeWatched ? "on" : "off"}`);
+      continue outer;
+    }
+
+    if (next === "tree") {
+      const result = await treePrompt({
+        root,
+        files: pool,
+        history,
+        title: `${MODE_LABELS[mediaMode]} library`,
+      });
+      if (result.action === "roll") {
+        if (result.folder !== root) {
+          root = result.folder;
+          settings = {
+            ...settings,
+            lastFolder: root,
+            recentFolders: withRecentFolder(settings.recentFolders ?? [], root, settings.recentLimit),
+          };
+          await saveSettings(settings).catch(() => {});
+        }
+        count = filesUnder(result.node).length || 1;
+        continue outer;
+      }
+      if (result.action === "browse") {
+        const picked = await chooseFolder(undefined, root);
+        if (typeof picked !== "string") break;
+        root = picked;
+        settings = { ...settings, lastFolder: picked };
+        await saveSettings(settings).catch(() => {});
+        continue outer;
+      }
+      continue;
+    }
+
+    if (next === "recentFolders") {
+      const picked = await chooseRecentFolder(settings.recentFolders ?? []);
+      if (picked === CANCEL_RECENT) continue;
+      const target = picked === "" ? await chooseFolder(undefined, root) : picked;
+      if (typeof target !== "string") continue;
+      root = target;
+      settings = { ...settings, lastFolder: target };
       await saveSettings(settings).catch(() => {});
       continue outer;
     }
 
-    if (answer === "m") {
+    if (next === "recentFiles") {
+      const entries = (await loadRecentFiles()).slice(0, 20);
+      const chosen = await chooseRecentFile(entries);
+      if (typeof chosen !== "object" || chosen === null) continue;
+      const file = await resolveRecent(chosen);
+      if (!file) {
+        log.warn(`No longer there: ${chosen.name}`);
+        continue;
+      }
+      await openDirect(file, chosen.folder, watchMode);
+      continue;
+    }
+
+    if (next === "library") {
+      const chosen = await libraryView(pool, history, sortMode, mediaMode);
+      if (typeof chosen !== "object" || chosen === null) continue;
+      await openDirect(chosen, root, watchMode);
+      continue;
+    }
+
+    if (next === "filter") {
+      const asked = await promptSizeRange("");
+      if (typeof asked === "symbol") continue;
+      sizeRange = asked;
+      continue outer;
+    }
+
+    if (next === "changeFolder") {
+      const picked = await chooseFolder(undefined, root);
+      if (typeof picked !== "string") break;
+      root = picked;
+      settings = {
+        ...settings,
+        lastFolder: picked,
+        recentFolders: withRecentFolder(settings.recentFolders ?? [], picked, settings.recentLimit),
+      };
+      await saveSettings(settings).catch(() => {});
+      continue outer;
+    }
+
+    if (next === "changeMode") {
       const switched = await chooseMediaMode(mediaMode);
       if (typeof switched !== "string") break;
       mediaMode = switched;
@@ -514,7 +694,17 @@ const next = await text({
       continue outer;
     }
 
-    break;
+    if (next === "roll1" || next === "roll3" || next === "roll5" || next === "rollAll") {
+      count = next === "rollAll" ? pool.length : Number(next.slice(4));
+      continue outer;
+    }
+
+    if (next === "help") {
+      for (const line of panel(helpLines(), "shortcuts")) log.message(line);
+      continue;
+    }
+
+    continue outer; // "again": rescan and roll the same way
   }
 
   outro(color.dim("bye"));
@@ -533,6 +723,137 @@ async function searchSort(): Promise<SortMode | symbol> {
     maxVisible: 4,
   });
   return isSearchCancel(chosen) ? Symbol.for("rndvid.cancel") : chosen;
+}
+
+/** Sentinel meaning "the recent list had nothing usable in it". */
+const CANCEL_RECENT = Symbol.for("rndvid.cancel");
+
+type BarChoice =
+  | "again"
+  | "roll1"
+  | "roll3"
+  | "roll5"
+  | "rollAll"
+  | "tree"
+  | "recentFiles"
+  | "recentFolders"
+  | "filter"
+  | "undo"
+  | "toggleWatched"
+  | "library"
+  | "changeFolder"
+  | "changeMode"
+  | "help"
+  | "quit"
+  | null;
+
+/**
+ * Single-keystroke action bar shown after each roll.
+ *
+ * Returns the chosen action, or null when the user pressed Ctrl+C.
+ */
+async function actionBar(): Promise<BarChoice> {
+  const pressed = await readOneKey();
+  if (isOneKeyCancel(pressed)) return null;
+
+  // Enter is the default: roll again the same way.
+  if (pressed.char === "" && pressed.name === "return") return "again";
+
+  switch (shortcutFor(pressed.char.toLowerCase())) {
+    case "roll1":
+      return "roll1";
+    case "roll3":
+      return "roll3";
+    case "roll5":
+      return "roll5";
+    case "rollAll":
+      return "rollAll";
+    case "tree":
+      return "tree";
+    case "recentFiles":
+      return "recentFiles";
+    case "recentFolders":
+      return "recentFolders";
+    case "filter":
+      return "filter";
+    case "undo":
+      return "undo";
+    case "toggleWatched":
+      return "toggleWatched";
+    case "library":
+      return "library";
+    case "changeFolder":
+      return "changeFolder";
+    case "quit":
+      return "quit";
+    case "help":
+      return "help";
+    default:
+      // `m` isn't in the shared table because it means different things in
+      // different prompts; here it switches media.
+      return pressed.char.toLowerCase() === "m" ? "changeMode" : "again";
+  }
+}
+
+/**
+ * Turn a recent-file record back into something openable.
+ *
+ * Recent entries deliberately store only folder + relative path, so they survive
+ * a rescan and don't bloat; the file may since have moved or been deleted, in
+ * which case this returns null rather than opening the wrong thing.
+ */
+async function resolveRecent(entry: RecentFile): Promise<MediaFile | null> {
+  const full = path.join(entry.folder, ...entry.rel.split("/"));
+  try {
+    const st = await fs.stat(full);
+    if (!st.isFile()) return null;
+    const dot = entry.name.lastIndexOf(".");
+    return {
+      path: full,
+      name: entry.name,
+      ext: dot > 0 ? entry.name.slice(dot + 1).toLowerCase() : "",
+      rel: entry.rel,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Open a single file directly, recording history and recent entries. */
+async function openDirect(
+  file: MediaFile,
+  folder: string,
+  wait: boolean,
+): Promise<void> {
+  log.message(`\n${describeFile(file)}`);
+
+  const history = await History.load(folder);
+  const token = history.markWatched(file);
+  await history.save().catch(() => {});
+  await recordRecentFile({
+    folder,
+    rel: file.rel,
+    name: file.name,
+    openedAt: Date.now(),
+  }).catch(() => {});
+  void token;
+
+  const startedAt = Date.now();
+  const result = await openInDefaultPlayer(file.path, { wait });
+  if (!result.ok) {
+    log.error(`Could not open ${file.name}: ${result.error ?? "unknown error"}`);
+  } else if (!result.waited) {
+    await waitForReturn();
+  }
+
+  const sessionMs = Date.now() - startedAt;
+  if (sessionMs > 30_000) {
+    history.recordSession(file, sessionMs);
+    await history.save().catch(() => {});
+    log.message(color.dim(`  watched ${formatDuration(sessionMs)}`));
+  }
 }
 
 const code = await (async () => {

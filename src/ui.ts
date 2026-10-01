@@ -68,6 +68,74 @@ export function relativeTime(timestampMs: number): string {
   return `${Math.round(months / 12)}y ago`;
 }
 
+/**
+ * Duration as `1h 04m`, `22m 10s`, `45s`.
+ *
+ * Seconds are dropped when zero, so a whole number of minutes reads as `22m`
+ * rather than the noisy `22m 00s`.
+ */
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "-";
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) {
+    return seconds === 0 ? `${minutes}m` : `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return restMinutes === 0 ? `${hours}h` : `${hours}h ${String(restMinutes).padStart(2, "0")}m`;
+}
+
+/**
+ * Text progress bar.
+ *
+ * Only for ratios we can actually measure — a watch session has no known total
+ * length, so it shows a duration instead of a misleading percentage.
+ * `frac` is clamped to 0..1 because exceeding it would emit more blocks than
+ * `width` and wrap the line.
+ */
+export function progressBar(frac: number, width = 10): string {
+  if (!Number.isFinite(frac) || width <= 0) return "";
+  const clamped = Math.max(0, Math.min(1, frac));
+  const filled = Math.round(clamped * width);
+  return "█".repeat(filled) + color.dim("░".repeat(width - filled));
+}
+
+/** Full block box around body lines, with an optional title on the top edge. */
+export function panel(
+  lines: readonly string[],
+  title?: string,
+  width = 60,
+): string[] {
+  const inner = Math.max(20, width - 4);
+  const out: string[] = [];
+
+  if (title === undefined) {
+    out.push(color.gray(`┌${"─".repeat(inner + 2)}┐`));
+  } else {
+    const label = ` ${truncate(title, inner - 2)} `;
+    const rest = inner + 2 - label.length;
+    out.push(color.gray(`┌${label}${color.dim("─".repeat(Math.max(0, rest)))}┐`));
+  }
+
+  for (const line of lines) {
+    const body = truncate(line, inner);
+    out.push(`${color.gray("│")} ${padTo(body, inner)} ${color.gray("│")}`);
+  }
+  out.push(color.gray(`└${"─".repeat(inner + 2)}┘`));
+  return out;
+}
+
+/** Single status line describing the active session, shown under prompts. */
+export function footer(parts: readonly string[]): string {
+  const filled = parts.filter((part) => part !== "");
+  return color.dim(`  ${filled.join(color.dim(" · "))}`);
+}
+
 export function formatDate(timestampMs: number): string {
   if (!timestampMs) return "-";
   const d = new Date(timestampMs);

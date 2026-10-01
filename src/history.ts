@@ -1,15 +1,29 @@
-﻿import path from "node:path";
+import path from "node:path";
 import fs from "node:fs/promises";
 
 import { folderKey, historyDir } from "./config.ts";
 import type { MediaFile } from "./scan.ts";
+
+export interface HistoryEntry {
+  lastPlayed: number;
+  plays: number;
+  /**
+   * Longest single session spent with the file open, in milliseconds.
+   *
+   * This is wall-clock time between launching the app and the app exiting, which
+   * is only a proxy for how far in you got — nothing asks the player where it
+   * is. Good enough to tell "finished" from "barely started", and honest about
+   * the difference.
+   */
+  watchedMs?: number;
+}
 
 interface HistoryFile {
   version: 1;
   /** Absolute root this history belongs to, for the "stale library" warning. */
   folder: string;
   /** Keyed by scan-relative posix path. */
-  entries: Record<string, { lastPlayed: number; plays: number }>;
+  entries: Record<string, HistoryEntry>;
 }
 
 /**
@@ -50,7 +64,13 @@ export class History {
           const entry = value as Record<string, unknown>;
           const lastPlayed = typeof entry["lastPlayed"] === "number" ? entry["lastPlayed"] : 0;
           const plays = typeof entry["plays"] === "number" ? entry["plays"] : 1;
-          entries[key] = { lastPlayed, plays };
+          entries[key] = {
+            lastPlayed,
+            plays,
+            ...(typeof entry["watchedMs"] === "number" && entry["watchedMs"] > 0
+              ? { watchedMs: entry["watchedMs"] }
+              : {}),
+          };
         }
       }
       const root = typeof obj["folder"] === "string" ? obj["folder"] : folder;
@@ -79,13 +99,55 @@ export class History {
     return this.data.entries[file.rel]?.lastPlayed ?? null;
   }
 
-  /** Record a launch. Called on launch, not on completion, so a file is only re-rolled after you actually opened it. */
-  markWatched(file: MediaFile): void {
+  /** Longest recorded session for this file, in milliseconds. 0 when unknown. */
+  watchedMs(file: MediaFile): number {
+    return this.data.entries[file.rel]?.watchedMs ?? 0;
+  }
+
+  /** Copy of an entry, used as an undo token. */
+  private snapshot(file: MediaFile): HistoryEntry | undefined {
+    const entry = this.data.entries[file.rel];
+    return entry === undefined ? undefined : { ...entry };
+  }
+
+  /**
+   * Record a launch. Called on launch, not on completion, so a file is only
+   * re-rolled after you actually opened it.
+   *
+   * Returns an undo token to hand back to `undo()`.
+   */
+  markWatched(file: MediaFile): HistoryEntry | null {
+    const previous = this.snapshot(file) ?? null;
     const existing = this.data.entries[file.rel];
     this.data.entries[file.rel] = {
       lastPlayed: Date.now(),
       plays: (existing?.plays ?? 0) + 1,
     };
+    return previous;
+  }
+
+  /**
+   * Fold a completed session into the entry, keeping the longest run rather than
+   * the latest — an accidental 10-second open shouldn't overwrite a real watch.
+   */
+  recordSession(file: MediaFile, durationMs: number): void {
+    const entry = this.data.entries[file.rel];
+    if (!entry || !Number.isFinite(durationMs) || durationMs <= 0) return;
+    entry.watchedMs = Math.max(entry.watchedMs ?? 0, Math.round(durationMs));
+  }
+
+  /**
+   * Undo a mark: restore the previous entry, or drop the key entirely when there
+   * wasn't one. Returns true when something actually changed.
+   */
+  undo(file: MediaFile, previous: HistoryEntry | null): boolean {
+    if (previous === null) {
+      if (this.data.entries[file.rel] === undefined) return false;
+      delete this.data.entries[file.rel];
+      return true;
+    }
+    this.data.entries[file.rel] = previous;
+    return true;
   }
 
   /** Drop entries for files no longer present in the library. */
